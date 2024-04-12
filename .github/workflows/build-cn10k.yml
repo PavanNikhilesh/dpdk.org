@@ -1,0 +1,100 @@
+name: build-cn10k
+
+on:
+  push:
+  schedule:
+    - cron: '0 0 * * 1'
+
+jobs:
+  ubuntu-cn10k-build:
+    name: ubuntu-cn10k-arm64
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: aarch64
+            distro: ubuntu22.04
+            compiler: gcc
+            library: static
+
+    steps:
+    - name: Checkout sources
+      uses: actions/checkout@v4
+    - name: Generate cache keys
+      id: get_ref_keys
+      run: |
+        echo 'ccache=ccache-${{ matrix.distro }}-${{ matrix.compiler }}-${{ matrix.arch }}-'$(date -u +%Y-w%W) >> $GITHUB_OUTPUT
+    - name: Retrieve ccache cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.ccache
+        key: ${{ steps.get_ref_keys.outputs.ccache }}-${{ github.ref }}
+        restore-keys: |
+          ${{ steps.get_ref_keys.outputs.ccache }}-refs/heads/main
+    - uses: uraimo/run-on-arch-action@v2.7.2
+      name: Build DPDK and generate package
+      id: build
+      with:
+        arch: ${{ matrix.arch }}
+        distro: ${{ matrix.distro }}
+        githubToken: ${{ github.token }}
+        setup: |
+          mkdir -p "${PWD}/artifacts"
+          mkdir -p ~/.ccache
+        dockerRunArgs: |
+          --volume "${PWD}/artifacts:/artifacts"
+          --volume "${HOME}/.ccache:/root/.ccache"
+        shell: /bin/bash
+        install: |
+          apt-get update -q -y
+          apt-get install -y ccache libarchive-dev libbsd-dev libbpf-dev
+          apt-get install -y libfdt-dev libjansson-dev
+          apt-get install -y libpcap-dev libssl-dev ninja-build pkg-config python3-pip
+          apt-get install -y python3-pyelftools python3-setuptools python3-wheel zlib1g-dev meson gcc
+          apt-get install -y build-essential ccache
+        run: |
+          export CC='ccache gcc'
+          ccache -p
+          meson build -Dplatform=cn10k --prefix="${PWD}/install"
+          ninja install -C build
+          sed -i '/prefix=/d' "${PWD}/install/lib/aarch64-linux-gnu/pkgconfig/libdpdk.pc"
+          sed -i '/prefix=/d' "${PWD}/install/lib/aarch64-linux-gnu/pkgconfig/libdpdk-libs.pc"
+          PKG_VERSION_NAME=`grep "Version:" "${PWD}/install/lib/aarch64-linux-gnu/pkgconfig/libdpdk.pc" | \
+          awk -F':' '{print $2}' | tr -d ' ' | awk -F'.' '{print $1"."$2}'`
+          mkdir -p "${PWD}/install/debian"
+          mkdir -p "${PWD}/install/DEBIAN"
+          cd "${PWD}/install"
+          echo 'Source: dpdk' > debian/control
+          echo 'Package: dpdk-'$PKG_VERSION_NAME'-cn10k' >> DEBIAN/control
+          echo 'Version: '$PKG_VERSION_NAME >> DEBIAN/control
+          echo "Depends: `dpkg-shlibdeps -O bin/dpdk-testpmd | awk -F'Depends=' '{print $2}'`" >> DEBIAN/control
+          echo "Maintainer: Jerin Jacob (jerinj@marvell.com)" >> DEBIAN/control
+          echo "Architecture: arm64" >> DEBIAN/control
+          echo "Homepage: https://www.dpdk.org/" >> DEBIAN/control
+          echo "Description: DPDK Library for Marvell Octeon 10" >> DEBIAN/control
+          cd -
+          mv "${PWD}/install" "${PWD}/dpdk-${PKG_VERSION_NAME}-cn10k_arm64"
+          dpkg --build "dpdk-${PKG_VERSION_NAME}-cn10k_arm64"
+          cp "dpdk-${PKG_VERSION_NAME}-cn10k_arm64.deb" /artifacts/.
+          echo "PKG_VERSION_NAME=${PKG_VERSION_NAME}" > /artifacts/env
+    - name: Export version name
+      id: artifacts
+      run: |
+        source "${PWD}/artifacts/env"
+        echo $PKG_VERSION_NAME
+        echo "PKG_VERSION_NAME=${PKG_VERSION_NAME}" >> "$GITHUB_OUTPUT"
+    - name: Upload debian package as artifact
+      uses: actions/upload-artifact@v4.3.1
+      env:
+        PKG_VERSION_NAME: ${{ steps.artifacts.outputs.PKG_VERSION_NAME }}
+      with:
+        name: dpdk-${{ steps.artifacts.outputs.PKG_VERSION_NAME }}-cn10k_arm64.deb
+        path: ${{ github.workspace }}/artifacts/dpdk-${{ steps.artifacts.outputs.PKG_VERSION_NAME }}-cn10k_arm64.deb
+    - name: Release DPDK cn10k package
+      uses: softprops/action-gh-release@v2.0.4
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+        files: |
+            ${{ github.workspace }}/artifacts/dpdk-${{ steps.artifacts.outputs.PKG_VERSION_NAME }}-cn10k_arm64.deb
